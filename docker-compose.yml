@@ -1,0 +1,31 @@
+version: '3.8' # Docker Compose faylining versiyasi
+
+services:
+  server: # Sizning Go backend xizmatingizning nomi (asosiy kod bajaruvchi server)
+    build:
+      context: . # Joriy katalogdagi Dockerfile ni ishlatish
+      dockerfile: Dockerfile # Loyiha ildizidagi Dockerfile
+    ports:
+      - "8080:8080" # Hostdagi 8080 portini konteynerdagi 8080 portiga bog'lash
+    restart: unless-stopped # Agar konteyner to'xtab qolsa, avtomatik ravishda qayta ishga tushirish
+    volumes:
+      # Kodni bajaruvchi konteynerlar uchun vaqtinchalik fayllarni saqlash uchun
+      # hostdagi katalogga bog'lash (Go backend tomonidan ishlatiladi)
+      - ./tmp:/tmp # Misol: loyiha ildizidagi 'tmp' katalogini konteynerdagi '/tmp' ga bog'lash
+
+  # Quyidagi xizmatlar asosan tegishli til tasvirlarini oldindan tortib olish
+  # va ularning mavjudligini ta'minlash uchun ishlatiladi.
+  # Kodni bajarish uchun Go backend ularni to'g'ridan-to'g'ri 'docker run' orqali ishga tushiradi.
+  # Ular o'z-o'zidan portlarni ochishi yoki doimiy jildlarni ulashi shart emas.
+
+  python_executor: # Python kodini bajarish uchun xizmat (tasvirni tortish)
+    image: python:3.12.10-alpine # Docker Hub'dan Python 3.12.10 Alpine tasvirini tortadi
+    # Bu yerda portlar va volumes kerak emas, chunki ular 'server' xizmati tomonidan dinamik boshqariladi.
+
+  javascript_executor: # JavaScript kodini bajarish uchun xizmat (tasvirni tortish)
+    image: node:22.16.0-alpine # Docker Hub'dan Node.js 22.16.0 Alpine tasvirini tortadi
+    # Bu yerda portlar va volumes kerak emas.
+
+  go_executor: # Go kodini bajarish uchun xizmat (tasvirni tortish)
+    image: golang:1.24.3-alpine # Docker Hub'dan Golang 1.24.3 Alpine tasvirini tortadi
+    # Bu yerda portlar va volumes kerak emas
