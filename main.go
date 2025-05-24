@@ -55,7 +55,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 				defer conn.Close()
 				for {
 					// Clientdan xabar o'qish
-					msgType, msg, err := conn.ReadMessage()
+					_, msg, err := conn.ReadMessage() //msgType
 					if err != nil {
 						log.Println("WebSocket read error:", err)
 						break
@@ -71,10 +71,9 @@ func handler(ctx *fasthttp.RequestCtx) {
 					}
 
 					// app.ExecuteCode funksiyasini chaqirish
-					result := ExecuteCode(ExecutionRequest{
+					result := app.ExecuteCode(app.ExecutionRequest{
 						Code:      req.Code,
 						Language:  req.Language,
-						Stdin:     req.Input,
 						TimeoutMs: req.TimeoutMs,
 						MemoryMb:  req.MemoryMb,
 						CpuShares: req.CpuShares,
@@ -128,7 +127,6 @@ func handler(ctx *fasthttp.RequestCtx) {
 			result := app.ExecuteCode(app.ExecutionRequest{
 				Code:      req.Code,
 				Language:  req.Language,
-				Stdin:     req.Input,
 				TimeoutMs: req.TimeoutMs,
 				MemoryMb:  req.MemoryMb,
 				CpuShares: req.CpuShares,
@@ -170,6 +168,3 @@ func main() {
 		log.Fatal("Server error:", err)
 	}
 }
-
-// Oldingi RunCode funksiyasi olib tashlandi, chunki uning mantiqi noto'g'ri edi
-// va app.ExecuteCode funksiyasi uning vazifasini bajaradi.

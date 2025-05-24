@@ -10,149 +10,253 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync" // Goroutines bilan ishlash uchun
 	"time"
 )
 
+// TestCase - bitta test case uchun kirish va kutilgan natija
+// Endi id maydonini o'z ichiga oladi
+type TestCase struct {
+	ID         int    `json:"id"`          // Test case IDsi
+	InputText  string `json:"input_text"`  // Kirish ma'lumotlari
+	OutputText string `json:"output_text"` // Kutilgan natija
+	// is_correct maydoni bu yerda kerak emas, chunki bu judge tomonidan aniqlanadi
+}
+
+// IndividualTestResult - bitta test case ijrosining natijasi
+type IndividualTestResult struct {
+	ID         int     `json:"id"`          // Test case IDsi
+	InputText  string  `json:"input_text"`  // Kirish ma'lumotlari
+	OutputText string  `json:"output_text"` // Kutilgan natija
+	Actual     string  `json:"actual"`      // Koddan chiqqan haqiqiy natija
+	IsCorrect  bool    `json:"is_correct"`  // Test case to'g'ri o'tdimi
+	TimeMs     int64   `json:"time_ms"`
+	MemoryKb   float64 `json:"memory_kb"`
+	Error      string  `json:"error,omitempty"`  // Agar xato bo'lsa
+	Status     string  `json:"status,omitempty"` // TLE, RTE, MLE, CE kabi statuslar
+}
+
 // ExecutionRequest - foydalanuvchidan keladigan so'rovning JSON strukturasini belgilaydi
-// Bu struct main.go dagi Code structiga mos keladi
+// Endi test_cases ro'yxatini to'g'ridan-to'g'ri qabul qiladi
 type ExecutionRequest struct {
-	Code      string `json:"code"`
-	Language  string `json:"language"`
-	Stdin     string `json:"stdin"`
-	TimeoutMs int    `json:"timeout_ms"` // Vaqt cheklovi millisekundlarda
-	MemoryMb  int    `json:"memory_mb"`  // Xotira cheklovi megabaytlarda
-	CpuShares int    `json:"cpu_shares"` // CPU ulushi (0-1024, 1024 = to'liq CPU)
+	TestCases []TestCase `json:"test_cases"` // Yangi: test case'lar ro'yxati
+	Code      string     `json:"code"`
+	Language  string     `json:"language"`
+	TimeoutMs int        `json:"timeout_ms"` // Vaqt cheklovi millisekundlarda
+	MemoryMb  int        `json:"memory_mb"`  // Xotira cheklovi megabaytlarda
+	CpuShares int        `json:"cpu_shares"` // CPU ulushi (0-1024, 1024 = to'liq CPU)
 }
 
-// ExecutionResult - kod ijrosining natijasini qaytarish uchun JSON strukturasini belgilaydi
+// ExecutionResult - kod ijrosining umumiy natijasi (barcha test case'lar bo'yicha)
 type ExecutionResult struct {
-	Output   string `json:"output"`
-	Error    string `json:"error"`
-	Status   string `json:"status"` // "Accepted", "Time Limit Exceeded", "Runtime Error", "Memory Limit Exceeded", "Compilation Error", "Internal Error"
-	TimeMs   int64  `json:"time_ms"`
-	MemoryKb int64  `json:"memory_kb"` // Bu qismni aniq o'lchash murakkab, hozircha taxminiy yoki limitni ko'rsatamiz
+	OverallStatus string                 `json:"overall_status"` // "Accepted", "Wrong Answer", "Time Limit Exceeded"
+	TestResults   []IndividualTestResult `json:"test_results"`
 }
 
-// ExecuteCode - kodni Docker konteynerida bajarish uchun asosiy funksiya
+// problemStore va getProblemTestCases endi kerak emas, chunki test case'lar so'rovdan keladi.
+// var problemStore = map[string][]TestCase{...}
+// func getProblemTestCases(problemID string) ([]TestCase, error) {...}
+
+// ExecuteCode - kodni Docker konteynerida barcha test case'lar bo'yicha bajarish uchun asosiy funksiya
 func ExecuteCode(req ExecutionRequest) ExecutionResult {
-	// Vaqtinchalik katalog yaratish. Har bir ijro uchun noyob katalog bo'ladi.
-	// Bu, bir vaqtning o'zida bir nechta ijrolar bir-biriga xalaqit bermasligini ta'minlaydi.
-	// `os.TempDir()` tizimning standart vaqtinchalik katalogini ishlatadi (odatda /tmp)
-	tempDir, err := ioutil.TempDir(os.TempDir(), "code-execution-*")
-	if err != nil {
-		log.Printf("Vaqtinchalik katalog yaratishda xato: %v", err)
-		return ExecutionResult{Status: "Internal Error", Error: "Serverda vaqtinchalik katalog yaratishda xato."}
-	}
-	// Funksiya tugagach, vaqtinchalik katalogni o'chirishni ta'minlash
-	defer os.RemoveAll(tempDir)
-
-	// Kod faylining nomi va yo'lini aniqlash
-	codeFileName := getCodeFileName(req.Language)
-	codeFilePath := filepath.Join(tempDir, codeFileName)
-
-	// Kirish ma'lumotlari (stdin) faylining yo'lini aniqlash
-	inputFilePath := filepath.Join(tempDir, "input.txt")
-
-	// Kodni faylga yozish
-	if err := ioutil.WriteFile(codeFilePath, []byte(req.Code), 0644); err != nil {
-		log.Printf("Kod faylini yozishda xato: %v", err)
-		return ExecutionResult{Status: "Internal Error", Error: "Kod faylini yozishda xato."}
+	overallResult := ExecutionResult{
+		OverallStatus: "Processing", // Boshlang'ich status
+		TestResults:   []IndividualTestResult{},
 	}
 
-	// Agar kirish ma'lumotlari bo'lsa, ularni faylga yozish
-	if req.Stdin != "" {
-		if err := ioutil.WriteFile(inputFilePath, []byte(req.Stdin), 0644); err != nil {
-			log.Printf("Input faylini yozishda xato: %v", err)
-			return ExecutionResult{Status: "Internal Error", Error: "Input faylini yozishda xato."}
-		}
+	if len(req.TestCases) == 0 {
+		overallResult.OverallStatus = "No Test Cases Provided"
+		overallResult.TestResults = append(overallResult.TestResults, IndividualTestResult{
+			Status: "Error", Error: "Kodni bajarish uchun test case'lar berilmagan.",
+		})
+		return overallResult
 	}
 
-	// Docker tasviri va ijro buyrug'ini tilga qarab aniqlash
-	dockerImage := getDockerImage(req.Language)
-	runCommand := getRunCommand(req.Language, codeFileName, inputFilePath)
+	// Test case'larni parallel bajarish uchun wait group
+	var wg sync.WaitGroup
+	resultsChan := make(chan IndividualTestResult, len(req.TestCases))
 
-	// Docker buyrug'ini qurish
-	// --rm: Konteyner ish tugagach avtomatik o'chiriladi
-	// --network=none: Konteynerning tarmoqqa chiqishini butunlay o'chirish (xavfsizlik uchun muhim)
-	// --memory: Xotira limiti (req.MemoryMb dan foydalanamiz)
-	// --memory-swap: Swap xotira limiti (xotira limitiga teng bo'lishi tavsiya etiladi)
-	// --cpu-shares: CPU ulushi (req.CpuShares dan foydalanamiz)
-	// -v: Hostdagi vaqtinchalik katalogni konteyner ichidagi /app katalogiga mount qilish
-	// --pids-limit: Konteynerda ishga tushirish mumkin bo'lgan jarayonlar sonini cheklash
-	// --security-opt=no-new-privileges: Konteyner ichida imtiyozlarni ko'tarishni oldini olish
-	// --cap-drop=ALL: Barcha Linux imtiyozlarini o'chirish
-	cmdArgs := []string{
-		"run", "--rm",
-		"--network=none",
-		fmt.Sprintf("--memory=%dm", req.MemoryMb),
-		fmt.Sprintf("--memory-swap=%dm", req.MemoryMb),
-		fmt.Sprintf("--cpu-shares=%d", req.CpuShares),
-		"-v", fmt.Sprintf("%s:/app", tempDir), // Kodni mount qilish
-		"--pids-limit=100", // Maksimal 100 ta jarayon
-		"--security-opt=no-new-privileges",
-		"--cap-drop=ALL",
-		dockerImage,
-	}
-	cmdArgs = append(cmdArgs, runCommand...)
+	for i, tc := range req.TestCases {
+		wg.Add(1)
+		go func(testCase TestCase) {
+			defer wg.Done()
 
-	// Vaqt cheklovini o'rnatish
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.TimeoutMs)*time.Millisecond)
-	defer cancel() // Kontekstni bekor qilishni ta'minlash
+			testName := fmt.Sprintf("test-%d (ID: %d)", i+1, testCase.ID)
+			log.Printf("Executing %s for Test Case ID: %d", req.Language, testCase.ID)
 
-	// Docker buyrug'ini bajarish
-	cmd := exec.CommandContext(ctx, "docker", cmdArgs...)
-
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout // Standart chiqishni ushlash
-	cmd.Stderr = &stderr // Xatolarni ushlash
-
-	startTime := time.Now() // Ijro boshlanish vaqti
-	err = cmd.Run()         // Buyruqni bajarish
-	endTime := time.Now()   // Ijro tugash vaqti
-
-	result := ExecutionResult{
-		Output: stdout.String(),
-		Error:  stderr.String(),
-		TimeMs: endTime.Sub(startTime).Milliseconds(),
-		// Xotira sarfini aniq o'lchash murakkab, bu yerda faqat limitni ko'rsatamiz
-		MemoryKb: int64(req.MemoryMb * 1024),
-	}
-
-	// Natijalarni tahlil qilish va statusni aniqlash
-	if ctx.Err() == context.DeadlineExceeded {
-		result.Status = "Time Limit Exceeded"
-	} else if err != nil {
-		// Agar Docker buyrug'i xato bilan tugasa
-		if exitError, ok := err.(*exec.ExitError); ok {
-			// Kompilyatsiya xatosi yoki Runtime xatosi
-			if req.Language == "java" || req.Language == "cpp" || req.Language == "go" { // Kompilyatsiya talab qiladigan tillar
-				// Agar stderrda kompilyatsiya xatosi bo'lsa
-				if strings.Contains(stderr.String(), "error:") ||
-					strings.Contains(stderr.String(), "compilation failed") ||
-					strings.Contains(stderr.String(), "undefined reference") { // C++ uchun
-					result.Status = "Compilation Error"
-				} else {
-					result.Status = "Runtime Error"
+			tempDir, err := ioutil.TempDir(os.TempDir(), fmt.Sprintf("code-execution-%d-*", testCase.ID))
+			if err != nil {
+				log.Printf("Vaqtinchalik katalog yaratishda xato (%s): %v", testName, err)
+				resultsChan <- IndividualTestResult{
+					ID: testCase.ID, InputText: testCase.InputText, OutputText: testCase.OutputText,
+					Status: "Internal Error", Error: fmt.Sprintf("Serverda vaqtinchalik katalog yaratishda xato: %v", err),
 				}
+				return
+			}
+			defer os.RemoveAll(tempDir) // Funksiya tugagach, vaqtinchalik katalogni o'chirish
+
+			codeFileName := getCodeFileName(req.Language)
+			codeFilePath := filepath.Join(tempDir, codeFileName)
+			inputFilePath := filepath.Join(tempDir, "input.txt")
+
+			if err := ioutil.WriteFile(codeFilePath, []byte(req.Code), 0644); err != nil {
+				log.Printf("Kod faylini yozishda xato (%s): %v", testName, err)
+				resultsChan <- IndividualTestResult{
+					ID: testCase.ID, InputText: testCase.InputText, OutputText: testCase.OutputText,
+					Status: "Internal Error", Error: fmt.Sprintf("Kod faylini yozishda xato: %v", err),
+				}
+				return
+			}
+			if err := ioutil.WriteFile(inputFilePath, []byte(testCase.InputText), 0644); err != nil {
+				log.Printf("Input faylini yozishda xato (%s): %v", testName, err)
+				resultsChan <- IndividualTestResult{
+					ID: testCase.ID, InputText: testCase.InputText, OutputText: testCase.OutputText,
+					Status: "Internal Error", Error: fmt.Sprintf("Input faylini yozishda xato: %v", err),
+				}
+				return
+			}
+
+			dockerImage := getDockerImage(req.Language)
+			runCommand := getRunCommand(req.Language, codeFileName, inputFilePath)
+
+			cmdArgs := []string{
+				"run", "--rm",
+				"--network=none",
+				fmt.Sprintf("--memory=%dm", req.MemoryMb),
+				fmt.Sprintf("--memory-swap=%dm", req.MemoryMb),
+				fmt.Sprintf("--cpu-shares=%d", req.CpuShares),
+				"-v", fmt.Sprintf("%s:/app", tempDir), // Kodni mount qilish
+				"--pids-limit=100",
+				"--security-opt=no-new-privileges",
+				"--cap-drop=ALL",
+				dockerImage,
+			}
+			cmdArgs = append(cmdArgs, runCommand...)
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.TimeoutMs)*time.Millisecond)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, "docker", cmdArgs...)
+
+			var stdout, stderr bytes.Buffer
+			cmd.Stdout = &stdout
+			cmd.Stderr = &stderr
+
+			startTime := time.Now()
+			cmdErr := cmd.Run()
+			endTime := time.Now()
+
+			actualOutput := strings.TrimSpace(stdout.String())       // Bo'shliqlarni olib tashlash
+			expectedOutput := strings.TrimSpace(testCase.OutputText) // Bo'shliqlarni olib tashlash
+
+			testResult := IndividualTestResult{
+				ID:         testCase.ID,
+				InputText:  testCase.InputText,
+				OutputText: testCase.OutputText,
+				Actual:     actualOutput,
+				IsCorrect:  false, // Default false
+				TimeMs:     endTime.Sub(startTime).Milliseconds(),
+				MemoryKb:   float64(req.MemoryMb * 1024), // Hozircha faqat limitni ko'rsatamiz
+				Error:      stderr.String(),
+			}
+
+			if ctx.Err() == context.DeadlineExceeded {
+				testResult.Status = "Time Limit Exceeded"
+				testResult.IsCorrect = false
+			} else if cmdErr != nil {
+				if _, ok := cmdErr.(*exec.ExitError); ok { //exitError
+					if req.Language == "java" || req.Language == "cpp" || req.Language == "go" {
+						if strings.Contains(stderr.String(), "error:") ||
+							strings.Contains(stderr.String(), "compilation failed") ||
+							strings.Contains(stderr.String(), "undefined reference") {
+							testResult.Status = "Compilation Error"
+						} else {
+							testResult.Status = "Runtime Error"
+						}
+					} else {
+						testResult.Status = "Runtime Error"
+					}
+					if strings.Contains(stderr.String(), "OOMKilled") || strings.Contains(stdout.String(), "OOMKilled") {
+						testResult.Status = "Memory Limit Exceeded"
+					}
+				} else {
+					log.Printf("Docker buyrug'ini bajarishda kutilmagan xato (%s): %v, stderr: %s", testName, cmdErr, stderr.String())
+					testResult.Status = "Internal Error"
+					testResult.Error = fmt.Sprintf("Docker buyrug'ini bajarishda kutilmagan xato: %v", cmdErr)
+				}
+				testResult.IsCorrect = false
 			} else {
-				result.Status = "Runtime Error"
+				if actualOutput == expectedOutput {
+					testResult.Status = "Accepted"
+					testResult.IsCorrect = true
+				} else {
+					testResult.Status = "Wrong Answer"
+					testResult.IsCorrect = false
+				}
 			}
-			// Docker loglarida "OOMKilled" ni tekshirish orqali Memory Limit Exceeded ni aniqlash mumkin
-			// Bu qismni qo'shimcha logika bilan kengaytirish mumkin
-			if strings.Contains(stderr.String(), "OOMKilled") || strings.Contains(stdout.String(), "OOMKilled") {
-				result.Status = "Memory Limit Exceeded"
-			}
-		} else {
-			// Boshqa turdagi sistemaviy xatolar
-			log.Printf("Docker buyrug'ini bajarishda kutilmagan xato: %v, stderr: %s", err, stderr.String())
-			result.Status = "Internal Error"
-			result.Error = fmt.Sprintf("Docker buyrug'ini bajarishda kutilmagan xato: %v", err)
-		}
-	} else {
-		result.Status = "Accepted"
+			resultsChan <- testResult
+		}(tc) // testCase ni goroutine'ga uzatish
 	}
 
-	return result
+	// Barcha goroutine'lar tugashini kutish
+	wg.Wait()
+	close(resultsChan) // Channelni yopish
+
+	// Natijalarni yig'ish
+	allTestsPassed := true
+	for res := range resultsChan {
+		overallResult.TestResults = append(overallResult.TestResults, res)
+		if !res.IsCorrect { // IsCorrect bo'lmasa, umumiy status Accepted bo'lmaydi
+			allTestsPassed = false
+		}
+	}
+
+	// Umumiy statusni aniqlash
+	if allTestsPassed {
+		overallResult.OverallStatus = "Accepted"
+	} else {
+		// Agar bittasi ham o'tmasa, umumiy statusni aniqlash
+		hasWrongAnswer := false
+		hasTLE := false
+		hasRTE := false
+		hasMLE := false
+		hasCE := false
+		hasInternalError := false
+
+		for _, res := range overallResult.TestResults {
+			if res.Status == "Wrong Answer" {
+				hasWrongAnswer = true
+			} else if res.Status == "Time Limit Exceeded" {
+				hasTLE = true
+			} else if res.Status == "Runtime Error" {
+				hasRTE = true
+			} else if res.Status == "Memory Limit Exceeded" {
+				hasMLE = true
+			} else if res.Status == "Compilation Error" {
+				hasCE = true
+			} else if res.Status == "Internal Error" {
+				hasInternalError = true
+			}
+		}
+
+		if hasInternalError {
+			overallResult.OverallStatus = "Internal Error"
+		} else if hasCE {
+			overallResult.OverallStatus = "Compilation Error"
+		} else if hasTLE {
+			overallResult.OverallStatus = "Time Limit Exceeded"
+		} else if hasMLE {
+			overallResult.OverallStatus = "Memory Limit Exceeded"
+		} else if hasRTE {
+			overallResult.OverallStatus = "Runtime Error"
+		} else if hasWrongAnswer {
+			overallResult.OverallStatus = "Wrong Answer"
+		} else {
+			overallResult.OverallStatus = "Failed" // Boshqa noma'lum xato
+		}
+	}
+
+	return overallResult
 }
 
 // getCodeFileName - tilga qarab kod faylining nomini qaytaradi
@@ -205,16 +309,12 @@ func getRunCommand(lang, codeFileName, inputFilePath string) []string {
 	case "python":
 		return []string{"sh", "-c", fmt.Sprintf("python /app/%s %s", codeFileName, inputRedirect)}
 	case "java":
-		// Java uchun kompilyatsiya va keyin ijro
 		return []string{"sh", "-c", fmt.Sprintf("javac /app/%s && java -classpath /app Main %s", codeFileName, inputRedirect)}
 	case "cpp":
-		// C++ uchun kompilyatsiya va keyin ijro
 		return []string{"sh", "-c", fmt.Sprintf("g++ -o /app/a.out /app/%s && /app/a.out %s", codeFileName, inputRedirect)}
 	case "go":
-		// Go uchun kompilyatsiya va keyin ijro
 		return []string{"sh", "-c", fmt.Sprintf("go run /app/%s %s", codeFileName, inputRedirect)}
 	case "javascript":
-		// JavaScript (Node.js) uchun ijro
 		return []string{"sh", "-c", fmt.Sprintf("node /app/%s %s", codeFileName, inputRedirect)}
 	default:
 		return []string{"echo", "Qo'llab-quvvatlanmaydigan dasturlash tili."}
