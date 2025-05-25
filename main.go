@@ -22,56 +22,75 @@ var upgrader = websocket.FastHTTPUpgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(ctx *fasthttp.RequestCtx) bool {
-		return true // Barcha originlarni qabul qilish (xavfsizlik uchun ishlab chiqarishda cheklash tavsiya etiladi)
+		return true
 	},
 }
 
-// Code structi endi app.ExecutionRequest bilan bir xil maydonlarga ega
-type Code struct {
+// CodeRequest - Problem ID bilan kodni bajarish uchun
+type CodeRequest struct {
+	ProblemID int    `json:"problem_id"` // Yangi: problem ID
 	Language  string `json:"language"`
 	Code      string `json:"code"`
-	Input     string `json:"input"`
-	TimeoutMs int    `json:"timeout_ms"` // Vaqt cheklovi millisekundlarda
-	MemoryMb  int    `json:"memory_mb"`  // Xotira cheklovi megabaytlarda
-	CpuShares int    `json:"cpu_shares"` // CPU ulushi (0-1024, 1024 = to'liq CPU)
+	TimeoutMs int    `json:"timeout_ms"`
+	MemoryMb  int    `json:"memory_mb"`
+	CpuShares int    `json:"cpu_shares"`
+}
+
+// ManualCodeRequest - Manual testcase'lar bilan kodni bajarish uchun
+type ManualCodeRequest struct {
+	TestCases []app.TestCase `json:"test_cases"` // Manual testcase'lar
+	Language  string         `json:"language"`
+	Code      string         `json:"code"`
+	TimeoutMs int            `json:"timeout_ms"`
+	MemoryMb  int            `json:"memory_mb"`
+	CpuShares int            `json:"cpu_shares"`
 }
 
 func handler(ctx *fasthttp.RequestCtx) {
-	// CORS sozlamalari (handler ichiga ko'chirildi, chunki fasthttp.ListenAndServe ichidagi funksiya har bir so'rov uchun ishlaydi)
+	// CORS sozlamalari
 	ctx.Response.Header.Set("Access-Control-Allow-Origin", ALLOWED_ORIGINS)
 	ctx.Response.Header.Set("Access-Control-Allow-Methods", ALLOWED_METHODS)
 	ctx.Response.Header.Set("Access-Control-Allow-Headers", ALLOWED_HEADERS)
 
-	// Preflight so'rovlar (OPTIONS)
 	if string(ctx.Method()) == "OPTIONS" {
 		ctx.SetStatusCode(fasthttp.StatusNoContent)
 		return
 	}
 
 	switch string(ctx.Path()) {
-	case "/ws": // WebSocket aloqasi uchun
+	case "/ws":
 		if string(ctx.Method()) == "GET" {
 			err := upgrader.Upgrade(ctx, func(conn *websocket.Conn) {
 				defer conn.Close()
 				for {
-					// Clientdan xabar o'qish
-					_, msg, err := conn.ReadMessage() //msgType
+					_, msg, err := conn.ReadMessage()
 					if err != nil {
 						log.Println("WebSocket read error:", err)
 						break
 					}
 					log.Printf("Received via WebSocket: %s", msg)
 
-					// WebSocket orqali kelgan kodni bajarish (JSON formatida kelishi kerak)
-					var req Code
+					var req CodeRequest
 					if err := json.Unmarshal(msg, &req); err != nil {
 						log.Println("WebSocket JSON parse error:", err)
 						conn.WriteMessage(websocket.TextMessage, []byte(`{"status": "Error", "error": "Invalid JSON format"}`))
 						continue
 					}
 
-					// app.ExecuteCode funksiyasini chaqirish
-					result := app.ExecuteCode(app.ExecutionRequest{
+					// Default qiymatlar
+					if req.TimeoutMs == 0 {
+						req.TimeoutMs = 5000
+					}
+					if req.MemoryMb == 0 {
+						req.MemoryMb = 128
+					}
+					if req.CpuShares == 0 {
+						req.CpuShares = 512
+					}
+
+					// Problem ID orqali kodni bajarish
+					result := app.ExecuteCodeWithProblemID(app.ExecutionRequest{
+						ProblemID: req.ProblemID,
 						Code:      req.Code,
 						Language:  req.Language,
 						TimeoutMs: req.TimeoutMs,
@@ -79,7 +98,6 @@ func handler(ctx *fasthttp.RequestCtx) {
 						CpuShares: req.CpuShares,
 					})
 
-					// Natijani JSON formatida WebSocket orqali qaytarish
 					responseBytes, err := json.Marshal(result)
 					if err != nil {
 						log.Println("WebSocket result marshal error:", err)
@@ -99,32 +117,32 @@ func handler(ctx *fasthttp.RequestCtx) {
 			ctx.Error("Method not allowed for /ws", fasthttp.StatusMethodNotAllowed)
 		}
 
-	case "/execute": // HTTP POST orqali kodni bajarish uchun
+	case "/execute":
 		if string(ctx.Method()) == "POST" {
 			body := ctx.PostBody()
 			log.Printf("POST /execute request received. Body size: %d bytes", len(body))
 
-			var req Code
-			// JSON request body'ni Code structiga to'g'ri tahlil qilish
+			var req CodeRequest
 			if err := json.Unmarshal(body, &req); err != nil {
 				log.Printf("POST /execute JSON parse error: %v, Body: %s", err, body)
 				ctx.Error(fmt.Sprintf("So'rovni parse qilishda xato: %v", err), fasthttp.StatusBadRequest)
 				return
 			}
 
-			// Default qiymatlarni o'rnatish, agar ular berilmagan bo'lsa
+			// Default qiymatlar
 			if req.TimeoutMs == 0 {
-				req.TimeoutMs = 5000 // 5 soniya
+				req.TimeoutMs = 5000
 			}
 			if req.MemoryMb == 0 {
-				req.MemoryMb = 128 // 128 MB
+				req.MemoryMb = 128
 			}
 			if req.CpuShares == 0 {
-				req.CpuShares = 512 // Yarim CPU ulushi
+				req.CpuShares = 512
 			}
 
-			// app.ExecuteCode funksiyasini chaqirish
-			result := app.ExecuteCode(app.ExecutionRequest{
+			// Problem ID orqali kodni bajarish
+			result := app.ExecuteCodeWithProblemID(app.ExecutionRequest{
+				ProblemID: req.ProblemID,
 				Code:      req.Code,
 				Language:  req.Language,
 				TimeoutMs: req.TimeoutMs,
@@ -132,7 +150,6 @@ func handler(ctx *fasthttp.RequestCtx) {
 				CpuShares: req.CpuShares,
 			})
 
-			// Natijani JSON formatida qaytarish
 			ctx.SetContentType("application/json")
 			ctx.SetStatusCode(fasthttp.StatusOK)
 			if err := json.NewEncoder(ctx).Encode(result); err != nil {
@@ -143,26 +160,65 @@ func handler(ctx *fasthttp.RequestCtx) {
 			ctx.Error("Method not allowed for /execute", fasthttp.StatusMethodNotAllowed)
 		}
 
+	case "/execute-manual":
+		if string(ctx.Method()) == "POST" {
+			body := ctx.PostBody()
+			log.Printf("POST /execute-manual request received. Body size: %d bytes", len(body))
+
+			var req ManualCodeRequest
+			if err := json.Unmarshal(body, &req); err != nil {
+				log.Printf("POST /execute-manual JSON parse error: %v", err)
+				ctx.Error(fmt.Sprintf("So'rovni parse qilishda xato: %v", err), fasthttp.StatusBadRequest)
+				return
+			}
+
+			// Default qiymatlar
+			if req.TimeoutMs == 0 {
+				req.TimeoutMs = 5000
+			}
+			if req.MemoryMb == 0 {
+				req.MemoryMb = 128
+			}
+			if req.CpuShares == 0 {
+				req.CpuShares = 512
+			}
+
+			// Manual testcase'lar bilan kodni bajarish
+			result := app.ExecuteCode(req.TestCases, app.ExecutionRequest{
+				Code:      req.Code,
+				Language:  req.Language,
+				TimeoutMs: req.TimeoutMs,
+				MemoryMb:  req.MemoryMb,
+				CpuShares: req.CpuShares,
+			})
+
+			ctx.SetContentType("application/json")
+			ctx.SetStatusCode(fasthttp.StatusOK)
+			if err := json.NewEncoder(ctx).Encode(result); err != nil {
+				log.Printf("Natijani JSON ga kodlashda xato: %v", err)
+				ctx.Error("Natijani qaytarishda xato.", fasthttp.StatusInternalServerError)
+			}
+		} else {
+			ctx.Error("Method not allowed for /execute-manual", fasthttp.StatusMethodNotAllowed)
+		}
+
 	default:
 		ctx.Error("Not found", fasthttp.StatusNotFound)
 	}
 }
 
 func main() {
-	// .env faylni yuklash
 	if err := godotenv.Load(); err != nil {
-		log.Println("Warning: .env fayli topilmadi yoki yuklashda xato:", err)
-		// .env fayl majburiy emas, shuning uchun Fatal o'rniga Println ishlatamiz
+		log.Println("Warning: .env fayli topilmadi:", err)
 	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080" // Default portni 8080 ga o'zgartirdik, chunki docker-compose da shunday
+		port = "8080"
 	}
 
-	// Serverni ishga tushirish
 	log.Printf("Server running on :%s", port)
-	err := fasthttp.ListenAndServe(":"+port, handler) // CORS logikasi handler ichiga ko'chirildi
+	err := fasthttp.ListenAndServe(":"+port, handler)
 
 	if err != nil {
 		log.Fatal("Server error:", err)
