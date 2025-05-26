@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/joho/godotenv"
+	"github.com/jackc/pgx/v5"  // PostgreSQL drayveri
+	"github.com/joho/godotenv" // .env fayllarni yuklash uchun
 )
 
 // TestCase - bitta test case uchun kirish va kutilgan natija
@@ -26,47 +26,52 @@ type TestCase struct {
 
 // IndividualTestResult - bitta test case ijrosining natijasi
 type IndividualTestResult struct {
-	ID         int     `json:"id"`
+	ID         int     `json:"id,omitempty"` // Test case IDsi (Problem IDga asoslangan testlar uchun)
 	InputText  string  `json:"input_text"`
-	OutputText string  `json:"output_text"`
+	OutputText string  `json:"output_text,omitempty"` // Kutilgan natija (custom inputda bo'lmasligi mumkin)
 	Actual     string  `json:"actual"`
-	IsCorrect  bool    `json:"is_correct"`
+	IsCorrect  bool    `json:"is_correct"` // Faqat OutputText mavjud bo'lganda tekshiriladi
 	TimeMs     int64   `json:"time_ms"`
 	MemoryKb   float64 `json:"memory_kb"`
 	Error      string  `json:"error,omitempty"`
-	Status     string  `json:"status,omitempty"`
+	Status     string  `json:"status,omitempty"` // TLE, RTE, MLE, CE kabi statuslar
 }
 
-// ExecutionRequest - foydalanuvchidan keladigan so'rov
+// ExecutionRequest - WebSocket orqali keladigan umumiy so'rov strukturasini belgilaydi
+// Bu struct barcha test turlarini (Problem ID, Custom Input, Manual Test Cases) qo'llab-quvvatlaydi
 type ExecutionRequest struct {
-	ProblemID int    `json:"problem_id"` // Yangi: problem ID orqali testcase'larni olish
-	Code      string `json:"code"`
-	Language  string `json:"language"`
-	TimeoutMs int    `json:"timeout_ms"`
-	MemoryMb  int    `json:"memory_mb"`
-	CpuShares int    `json:"cpu_shares"`
+	ProblemID   int        `json:"problem_id,omitempty"`   // Agar problem ID bo'lsa
+	CustomInput string     `json:"custom_input,omitempty"` // Agar custom input bo'lsa
+	TestCases   []TestCase `json:"test_cases,omitempty"`   // Agar test case'lar to'g'ridan-to'g'ri berilsa (manual)
+	Code        string     `json:"code"`
+	Language    string     `json:"language"`
+	TimeoutMs   int        `json:"timeout_ms"`
+	MemoryMb    int        `json:"memory_mb"`
+	CpuShares   int        `json:"cpu_shares"`
 }
 
 // ExecutionResult - kod ijrosining umumiy natijasi
 type ExecutionResult struct {
+	ProblemID     int                    `json:"problem_id,omitempty"`
 	OverallStatus string                 `json:"overall_status"`
 	TestResults   []IndividualTestResult `json:"test_results"`
 	TotalTests    int                    `json:"total_tests"`
 	PassedTests   int                    `json:"passed_tests"`
+	Error         string                 `json:"error,omitempty"` // Umumiy xato xabari
 }
 
 // NeonDB - Ma'lumotlar bazasidan testcase'larni olish
 func NeonDB(problemID int) ([]TestCase, error) {
-	// .env faylini yuklash
-	err := godotenv.Load()
-	if err != nil {
-		log.Printf("Warning: .env fayli yuklanmadi: %v", err)
+	// .env faylini yuklash (faqat bir marta yuklansa yaxshiroq, main.go da bo'lishi kerak)
+	// Bu yerda faqatgina himoya chorasi sifatida qoldirildi.
+	if err := godotenv.Load(); err != nil {
+		log.Printf("Warning: .env fayli yuklanmadi (NeonDB): %v", err)
 	}
 
 	// Ma'lumotlar bazasiga ulanish
 	connStr := os.Getenv("DATABASE_URL")
 	if connStr == "" {
-		return nil, fmt.Errorf("DATABASE_URL environment variable topilmadi")
+		return nil, fmt.Errorf("DATABASE_URL muhit o'zgaruvchisi topilmadi")
 	}
 
 	conn, err := pgx.Connect(context.Background(), connStr)
@@ -104,177 +109,188 @@ func NeonDB(problemID int) ([]TestCase, error) {
 	return testcases, nil
 }
 
-// ExecuteCodeWithProblemID - Problem ID orqali kodni bajarish
-func ExecuteCodeWithProblemID(req ExecutionRequest) ExecutionResult {
-	// Ma'lumotlar bazasidan testcase'larni olish
-	testCases, err := NeonDB(req.ProblemID)
+// executeSingleTestCase - bitta test case uchun kodni bajarishning asosiy logikasi
+func executeSingleTestCase(code, language, input string, timeoutMs, memoryMb, cpuShares int, testID int, expectedOutput string) IndividualTestResult {
+	testResult := IndividualTestResult{
+		ID:         testID,
+		InputText:  input,
+		OutputText: expectedOutput,
+		IsCorrect:  false,                    // Default false
+		MemoryKb:   float64(memoryMb * 1024), // Hozircha faqat limitni ko'rsatamiz
+	}
+
+	tempDir, err := ioutil.TempDir(os.TempDir(), fmt.Sprintf("code-execution-%d-*", testID))
 	if err != nil {
-		log.Printf("Testcase'larni olishda xato: %v", err)
-		return ExecutionResult{
-			OverallStatus: "Database Error",
-			TestResults: []IndividualTestResult{{
-				Status: "Error",
-				Error:  fmt.Sprintf("Testcase'larni olishda xato: %v", err),
-			}},
+		log.Printf("Vaqtinchalik katalog yaratishda xato (Test ID: %d): %v", testID, err)
+		testResult.Status = "Internal Error"
+		testResult.Error = fmt.Sprintf("Serverda vaqtinchalik katalog yaratishda xato: %v", err)
+		return testResult
+	}
+	defer os.RemoveAll(tempDir)
+
+	codeFileName := getCodeFileName(language)
+	codeFilePath := filepath.Join(tempDir, codeFileName)
+	inputFilePath := filepath.Join(tempDir, "input.txt")
+
+	if err := ioutil.WriteFile(codeFilePath, []byte(code), 0644); err != nil {
+		log.Printf("Kod faylini yozishda xato (Test ID: %d): %v", testID, err)
+		testResult.Status = "Internal Error"
+		testResult.Error = fmt.Sprintf("Kod faylini yozishda xato: %v", err)
+		return testResult
+	}
+	if input != "" { // Agar input bo'lsa, faylga yozish
+		if err := ioutil.WriteFile(inputFilePath, []byte(input), 0644); err != nil {
+			log.Printf("Input faylini yozishda xato (Test ID: %d): %v", testID, err)
+			testResult.Status = "Internal Error"
+			testResult.Error = fmt.Sprintf("Input faylini yozishda xato: %v", err)
+			return testResult
 		}
 	}
 
-	log.Printf("Problem ID %d uchun %d ta testcase topildi", req.ProblemID, len(testCases))
+	dockerImage := getDockerImage(language)
+	runCommand := getRunCommand(language, codeFileName, inputFilePath)
 
-	// Eski ExecuteCode funksiyasini ishlatish
-	legacyReq := ExecutionRequest{
-		Code:      req.Code,
-		Language:  req.Language,
-		TimeoutMs: req.TimeoutMs,
-		MemoryMb:  req.MemoryMb,
-		CpuShares: req.CpuShares,
+	cmdArgs := []string{
+		"run", "--rm",
+		"--network=none",
+		fmt.Sprintf("--memory=%dm", memoryMb),
+		fmt.Sprintf("--memory-swap=%dm", memoryMb),
+		fmt.Sprintf("--cpu-shares=%d", cpuShares),
+		"-v", fmt.Sprintf("%s:/app", tempDir),
+		"--pids-limit=100",
+		"--security-opt=no-new-privileges",
+		"--cap-drop=ALL",
+		dockerImage,
 	}
+	cmdArgs = append(cmdArgs, runCommand...)
 
-	return executeCodeInternal(testCases, legacyReq)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutMs)*time.Millisecond)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "docker", cmdArgs...)
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	startTime := time.Now()
+	cmdErr := cmd.Run()
+	endTime := time.Now()
+
+	testResult.TimeMs = endTime.Sub(startTime).Milliseconds()
+	testResult.Actual = strings.TrimSpace(stdout.String())
+	testResult.Error = stderr.String()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		testResult.Status = "Time Limit Exceeded"
+	} else if cmdErr != nil {
+		if _, ok := cmdErr.(*exec.ExitError); ok {
+			if language == "java" || language == "cpp" || language == "go" {
+				if strings.Contains(stderr.String(), "error:") ||
+					strings.Contains(stderr.String(), "compilation failed") ||
+					strings.Contains(stderr.String(), "undefined reference") {
+					testResult.Status = "Compilation Error"
+				} else {
+					testResult.Status = "Runtime Error"
+				}
+			} else {
+				testResult.Status = "Runtime Error"
+			}
+			if strings.Contains(stderr.String(), "OOMKilled") || strings.Contains(stdout.String(), "OOMKilled") {
+				testResult.Status = "Memory Limit Exceeded"
+			}
+		} else {
+			log.Printf("Docker buyrug'ini bajarishda kutilmagan xato (Test ID: %d): %v, stderr: %s", testID, cmdErr, stderr.String())
+			testResult.Status = "Internal Error"
+			testResult.Error = fmt.Sprintf("Docker buyrug'ini bajarishda kutilmagan xato: %v", cmdErr)
+		}
+	} else {
+		// Agar expectedOutput mavjud bo'lsa, solishtirish
+		if expectedOutput != "" {
+			trimmedExpected := strings.TrimSpace(expectedOutput)
+			if testResult.Actual == trimmedExpected {
+				testResult.Status = "Accepted"
+				testResult.IsCorrect = true
+			} else {
+				testResult.Status = "Wrong Answer"
+			}
+		} else {
+			// Custom input holatida faqat ijro etildi deb hisoblaymiz
+			testResult.Status = "Executed"
+			testResult.IsCorrect = true // Bu yerda "to'g'ri" degani, kod xatosiz bajarildi degani
+		}
+	}
+	return testResult
 }
 
-// Eski ExecuteCode funksiyasi (testcase'lar to'g'ridan-to'g'ri berilganda)
-func ExecuteCode(testCases []TestCase, req ExecutionRequest) ExecutionResult {
-	return executeCodeInternal(testCases, req)
-}
-
-// executeCodeInternal - asosiy bajarish logikasi
-func executeCodeInternal(testCases []TestCase, req ExecutionRequest) ExecutionResult {
+// ExecuteCode - Asosiy bajarish funksiyasi. So'rov turini aniqlaydi va tegishli logikani chaqiradi.
+func ExecuteCode(req ExecutionRequest) ExecutionResult {
 	overallResult := ExecutionResult{
+		ProblemID:     req.ProblemID, // ProblemID ni natijaga qo'shish
 		OverallStatus: "Processing",
 		TestResults:   []IndividualTestResult{},
-		TotalTests:    len(testCases),
 		PassedTests:   0,
 	}
 
-	if len(testCases) == 0 {
-		overallResult.OverallStatus = "No Test Cases"
+	var testCasesToExecute []TestCase
+	var err error
+
+	if req.ProblemID != 0 {
+		// Problem ID asosida test case'larni ma'lumotlar bazasidan olish
+		testCasesToExecute, err = NeonDB(req.ProblemID)
+		if err != nil {
+			log.Printf("Testcase'larni olishda xato (Problem ID: %d): %v", req.ProblemID, err)
+			overallResult.OverallStatus = "Problem Not Found or DB Error"
+			overallResult.Error = fmt.Sprintf("Testcase'larni ma'lumotlar bazasidan olishda xato: %v", err)
+			return overallResult
+		}
+		log.Printf("Problem ID %d uchun %d ta testcase topildi", req.ProblemID, len(testCasesToExecute))
+	} else if req.CustomInput != "" {
+		// Custom input bilan faqat bitta test case yaratish
+		testCasesToExecute = []TestCase{
+			{ID: 0, InputText: req.CustomInput, OutputText: ""}, // Custom inputda expected output bo'lmaydi
+		}
+		log.Printf("Custom input bilan kod bajarilmoqda.")
+	} else if len(req.TestCases) > 0 {
+		// Manual test case'lar to'g'ridan-to'g'ri so'rovdan olinadi
+		testCasesToExecute = req.TestCases
+		log.Printf("Manual test case'lar bilan kod bajarilmoqda. %d ta testcase.", len(testCasesToExecute))
+	} else {
+		// Hech qanday test turi aniqlanmagan
+		overallResult.OverallStatus = "Error"
+		overallResult.Error = "Test qilish uchun hech qanday Problem ID, Custom Input yoki Test Case'lar berilmagan."
 		return overallResult
 	}
 
-	// Parallel bajarish
-	var wg sync.WaitGroup
-	resultsChan := make(chan IndividualTestResult, len(testCases))
+	overallResult.TotalTests = len(testCasesToExecute)
 
-	for i, tc := range testCases {
+	if len(testCasesToExecute) == 0 {
+		overallResult.OverallStatus = "No Test Cases Found"
+		overallResult.Error = "Bajarish uchun test case'lar topilmadi."
+		return overallResult
+	}
+
+	// Test case'larni parallel bajarish
+	var wg sync.WaitGroup
+	resultsChan := make(chan IndividualTestResult, len(testCasesToExecute))
+
+	for i, tc := range testCasesToExecute {
 		wg.Add(1)
+		// Goroutine ichida tc va i ni o'zgaruvchi sifatida uzatish, chunki tsikl tez aylanadi
 		go func(testCase TestCase, index int) {
 			defer wg.Done()
-
-			testName := fmt.Sprintf("test-%d (ID: %d)", index+1, testCase.ID)
-			log.Printf("%s tilida Test Case ID: %d ni bajarish: testcase: %v", req.Language, testCase.ID, testName)
-
-			tempDir, err := ioutil.TempDir(os.TempDir(), fmt.Sprintf("code-execution-%d-*", testCase.ID))
-			if err != nil {
-				resultsChan <- IndividualTestResult{
-					ID: testCase.ID, InputText: testCase.InputText, OutputText: testCase.OutputText,
-					Status: "Internal Error", Error: fmt.Sprintf("Vaqtinchalik katalog yaratishda xato: %v", err),
-				}
-				return
+			// Agar custom input bo'lsa, ID 0 bo'lishi mumkin, shuning uchun noyob ID yaratish
+			currentTestID := testCase.ID
+			if currentTestID == 0 {
+				currentTestID = index + 1 // Yoki uuid.New().ID() kabi noyob ID
 			}
-			defer os.RemoveAll(tempDir)
-
-			codeFileName := getCodeFileName(req.Language)
-			codeFilePath := filepath.Join(tempDir, codeFileName)
-			inputFilePath := filepath.Join(tempDir, "input.txt")
-
-			if err := ioutil.WriteFile(codeFilePath, []byte(req.Code), 0644); err != nil {
-				resultsChan <- IndividualTestResult{
-					ID: testCase.ID, InputText: testCase.InputText, OutputText: testCase.OutputText,
-					Status: "Internal Error", Error: fmt.Sprintf("Kod faylini yozishda xato: %v", err),
-				}
-				return
-			}
-
-			if err := ioutil.WriteFile(inputFilePath, []byte(testCase.InputText), 0644); err != nil {
-				resultsChan <- IndividualTestResult{
-					ID: testCase.ID, InputText: testCase.InputText, OutputText: testCase.OutputText,
-					Status: "Internal Error", Error: fmt.Sprintf("Input faylini yozishda xato: %v", err),
-				}
-				return
-			}
-
-			dockerImage := getDockerImage(req.Language)
-			runCommand := getRunCommand(req.Language, codeFileName, inputFilePath)
-
-			cmdArgs := []string{
-				"run", "--rm",
-				"--network=none",
-				fmt.Sprintf("--memory=%dm", req.MemoryMb),
-				fmt.Sprintf("--memory-swap=%dm", req.MemoryMb),
-				fmt.Sprintf("--cpu-shares=%d", req.CpuShares),
-				"-v", fmt.Sprintf("%s:/app", tempDir),
-				"--pids-limit=100",
-				"--security-opt=no-new-privileges",
-				"--cap-drop=ALL",
-				dockerImage,
-			}
-			cmdArgs = append(cmdArgs, runCommand...)
-
-			ctx, cancel := context.WithTimeout(context.Background(), time.Duration(req.TimeoutMs)*time.Millisecond)
-			defer cancel()
-
-			cmd := exec.CommandContext(ctx, "docker", cmdArgs...)
-
-			var stdout, stderr bytes.Buffer
-			cmd.Stdout = &stdout
-			cmd.Stderr = &stderr
-
-			startTime := time.Now()
-			cmdErr := cmd.Run()
-			endTime := time.Now()
-
-			actualOutput := strings.TrimSpace(stdout.String())
-			expectedOutput := strings.TrimSpace(testCase.OutputText)
-
-			testResult := IndividualTestResult{
-				ID:         testCase.ID,
-				InputText:  testCase.InputText,
-				OutputText: testCase.OutputText,
-				Actual:     actualOutput,
-				IsCorrect:  false,
-				TimeMs:     endTime.Sub(startTime).Milliseconds(),
-				MemoryKb:   float64(req.MemoryMb * 1024),
-				Error:      stderr.String(),
-			}
-
-			// Status aniqlash
-			if ctx.Err() == context.DeadlineExceeded {
-				testResult.Status = "Time Limit Exceeded"
-			} else if cmdErr != nil {
-				if _, ok := cmdErr.(*exec.ExitError); ok {
-					if req.Language == "java" || req.Language == "cpp" || req.Language == "go" {
-						if strings.Contains(stderr.String(), "error:") ||
-							strings.Contains(stderr.String(), "compilation failed") {
-							testResult.Status = "Compilation Error"
-						} else {
-							testResult.Status = "Runtime Error"
-						}
-					} else {
-						testResult.Status = "Runtime Error"
-					}
-					if strings.Contains(stderr.String(), "OOMKilled") {
-						testResult.Status = "Memory Limit Exceeded"
-					}
-				} else {
-					testResult.Status = "Internal Error"
-					testResult.Error = fmt.Sprintf("Docker xatosi: %v", cmdErr)
-				}
-			} else {
-				if actualOutput == expectedOutput {
-					testResult.Status = "Accepted"
-					testResult.IsCorrect = true
-				} else {
-					testResult.Status = "Wrong Answer"
-				}
-			}
-
-			resultsChan <- testResult
+			res := executeSingleTestCase(req.Code, req.Language, testCase.InputText, req.TimeoutMs, req.MemoryMb, req.CpuShares, currentTestID, testCase.OutputText)
+			resultsChan <- res
 		}(tc, i)
 	}
 
 	wg.Wait()
-	close(resultsChan)
+	close(resultsChan) // Channelni yopish
 
 	// Natijalarni yig'ish
 	allTestsPassed := true
@@ -287,11 +303,11 @@ func executeCodeInternal(testCases []TestCase, req ExecutionRequest) ExecutionRe
 		}
 	}
 
-	// Umumiy status
+	// Umumiy statusni aniqlash
 	if allTestsPassed {
 		overallResult.OverallStatus = "Accepted"
 	} else {
-		// Birinchi xatoga qarab status
+		// Birinchi xatoga qarab umumiy statusni belgilash
 		for _, res := range overallResult.TestResults {
 			if !res.IsCorrect {
 				overallResult.OverallStatus = res.Status
