@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jackc/pgx/v5"  // PostgreSQL drayveri
-	"github.com/joho/godotenv" // .env fayllarni yuklash uchun
+	"github.com/jackc/pgx/v5"
+	"github.com/joho/godotenv"
 )
 
 // TestCase - bitta test case uchun kirish va kutilgan natija
@@ -62,26 +62,25 @@ type ExecutionResult struct {
 
 // NeonDB - Ma'lumotlar bazasidan testcase'larni olish
 func NeonDB(problemID int) ([]TestCase, error) {
-	// .env faylini yuklash (faqat bir marta yuklansa yaxshiroq, main.go da bo'lishi kerak)
-	// Bu yerda faqatgina himoya chorasi sifatida qoldirildi.
 	if err := godotenv.Load(); err != nil {
 		log.Printf("Warning: .env fayli yuklanmadi (NeonDB): %v", err)
 	}
 
-	// Ma'lumotlar bazasiga ulanish
 	connStr := os.Getenv("DATABASE_URL")
 	if connStr == "" {
 		return nil, fmt.Errorf("DATABASE_URL muhit o'zgaruvchisi topilmadi")
 	}
 
-	conn, err := pgx.Connect(context.Background(), connStr)
+	conn, err := pgx.Connect(context.Background(), "postgresql://leetcode_owner:npg_LtPQ6Arb9dJB@ep-polished-shadow-a24k41kj-pooler.eu-central-1.aws.neon.tech/leetcode?sslmode=require")
 	if err != nil {
 		return nil, fmt.Errorf("ma'lumotlar bazasiga ulanishda xato: %v", err)
 	}
 	defer conn.Close(context.Background())
 
 	// Testcase'larni olish
-	query := "SELECT id, input_text, output_text FROM problems_testcases WHERE problem_id = $1 ORDER BY id"
+	// E'tibor bering: sizning so'rovingizda `input_txt` va `output_txt` nomlari ishlatilgan.
+	// Agar DB ustun nomlari `input_text` va `output_text` bo'lsa, so'rovni shunga moslang.
+	query := "SELECT id, input_txt, output_txt FROM problems_testcase WHERE problem_id=$1 ORDER BY id"
 	rows, err := conn.Query(context.Background(), query, problemID)
 	if err != nil {
 		return nil, fmt.Errorf("so'rovni bajarishda xato: %v", err)
@@ -130,15 +129,18 @@ func executeSingleTestCase(code, language, input string, timeoutMs, memoryMb, cp
 
 	codeFileName := getCodeFileName(language)
 	codeFilePath := filepath.Join(tempDir, codeFileName)
-	inputFilePath := filepath.Join(tempDir, "input.txt")
+	inputFileName := "input.txt"                           // Input fayl nomi
+	inputFilePath := filepath.Join(tempDir, inputFileName) // Hostdagi to'liq yo'l
 
+	// Kod faylini yozish
 	if err := ioutil.WriteFile(codeFilePath, []byte(code), 0644); err != nil {
 		log.Printf("Kod faylini yozishda xato (Test ID: %d): %v", testID, err)
 		testResult.Status = "Internal Error"
 		testResult.Error = fmt.Sprintf("Kod faylini yozishda xato: %v", err)
 		return testResult
 	}
-	if input != "" { // Agar input bo'lsa, faylga yozish
+	// Input faylini yozish (agar input mavjud bo'lsa)
+	if input != "" {
 		if err := ioutil.WriteFile(inputFilePath, []byte(input), 0644); err != nil {
 			log.Printf("Input faylini yozishda xato (Test ID: %d): %v", testID, err)
 			testResult.Status = "Internal Error"
@@ -148,7 +150,14 @@ func executeSingleTestCase(code, language, input string, timeoutMs, memoryMb, cp
 	}
 
 	dockerImage := getDockerImage(language)
-	runCommand := getRunCommand(language, codeFileName, inputFilePath)
+
+	// Konteyner ichidagi input fayl yo'lini aniqlash
+	containerInputFilePath := ""
+	if input != "" { // Faqat input mavjud bo'lsa, yo'lni belgilaymiz
+		containerInputFilePath = "/app/" + inputFileName // Konteyner ichidagi to'liq yo'l
+	}
+	// getRunCommand funksiyasiga endi konteyner ichidagi input fayl yo'lini uzatamiz
+	runCommand := getRunCommand(language, codeFileName, containerInputFilePath)
 
 	cmdArgs := []string{
 		"run", "--rm",
@@ -156,7 +165,7 @@ func executeSingleTestCase(code, language, input string, timeoutMs, memoryMb, cp
 		fmt.Sprintf("--memory=%dm", memoryMb),
 		fmt.Sprintf("--memory-swap=%dm", memoryMb),
 		fmt.Sprintf("--cpu-shares=%d", cpuShares),
-		"-v", fmt.Sprintf("%s:/app", tempDir),
+		"-v", fmt.Sprintf("%s:/app", tempDir), // Hostdagi tempDir ni konteynerdagi /app ga mount qilamiz
 		"--pids-limit=100",
 		"--security-opt=no-new-privileges",
 		"--cap-drop=ALL",
@@ -354,10 +363,13 @@ func getDockerImage(lang string) string {
 	}
 }
 
-func getRunCommand(lang, codeFileName, inputFilePath string) []string {
+// getRunCommand - tilga qarab kodni bajarish uchun Docker ichidagi buyruqni qaytaradi
+// containerInputFilePath endi konteyner ichidagi to'liq yo'l bo'lishi kerak
+func getRunCommand(lang, codeFileName, containerInputFilePath string) []string {
 	inputRedirect := ""
-	if _, err := os.Stat(inputFilePath); err == nil {
-		inputRedirect = fmt.Sprintf("< /app/%s", filepath.Base(inputFilePath))
+	// Faqat input fayl yo'li berilgan bo'lsa, uni yo'naltiramiz
+	if containerInputFilePath != "" {
+		inputRedirect = fmt.Sprintf("< %s", containerInputFilePath)
 	}
 
 	switch lang {

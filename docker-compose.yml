@@ -11,7 +11,27 @@ services:
     volumes:
       # Kodni bajaruvchi konteynerlar uchun vaqtinchalik fayllarni saqlash uchun
       # hostdagi katalogga bog'lash (Go backend tomonidan ishlatiladi)
-      - ./tmp:/tmp # Misol: loyiha ildizidagi 'tmp' katalogini konteynerdagi '/tmp' ga bog'lash
+      - ./tmp:/tmp 
+      # MUHIM: Docker socketini ulash. Bu Go backend konteyneriga hostdagi Docker daemon bilan aloqa qilish imkonini beradi.
+      - /var/run/docker.sock:/var/run/docker.sock 
+      - ./.env:/app/.env
+    environment:
+      # MUHIM: DATABASE_URL ni Neon.tech tomonidan berilgan haqiqiy ulanish satri bilan almashtiring!
+      # Misol: postgresql://[user]:[password]@[host]:[port]/[database_name]?options=project%3D[project-id]
+      # Neon.tech konsolida "Connection Details" bo'limidan oling.
+      # E'tibor bering: qiymatdan tashqi qo'shtirnoqlar olib tashlandi.
+      - DATABASE_URL='postgresql://leetcode_owner:npg_LtPQ6Arb9dJB@ep-polished-shadow-a24k41kj-pooler.eu-central-1.aws.neon.tech/leetcode?sslmode=require'
+    # depends_on: - db qismi olib tashlandi, chunki endi lokal db xizmati yo'q.
+
+  # db: # Lokal PostgreSQL ma'lumotlar bazasi xizmati butunlay olib tashlandi, chunki Neon.tech ishlatilmoqda.
+  #   image: postgres:13-alpine 
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_DB: your_database_name
+  #     POSTGRES_USER: user
+  #     POSTGRES_PASSWORD: password
+  #   volumes:
+  #     - db_data:/var/lib/postgresql/data 
 
   # Quyidagi xizmatlar asosan tegishli til tasvirlarini oldindan tortib olish
   # va ularning mavjudligini ta'minlash uchun ishlatiladi.
@@ -20,12 +40,12 @@ services:
 
   python_executor: # Python kodini bajarish uchun xizmat (tasvirni tortish)
     image: python:3.12.10-alpine # Docker Hub'dan Python 3.12.10 Alpine tasvirini tortadi
-    # Bu yerda portlar va volumes kerak emas, chunki ular 'server' xizmati tomonidan dinamik boshqariladi.
 
   javascript_executor: # JavaScript kodini bajarish uchun xizmat (tasvirni tortish)
     image: node:22.16.0-alpine # Docker Hub'dan Node.js 22.16.0 Alpine tasvirini tortadi
-    # Bu yerda portlar va volumes kerak emas.
 
   go_executor: # Go kodini bajarish uchun xizmat (tasvirni tortish)
     image: golang:1.24.3-alpine # Docker Hub'dan Golang 1.24.3 Alpine tasvirini tortadi
-    # Bu yerda portlar va volumes kerak emas
+
+# volumes: # Doimiy ma'lumotlar uchun volume'lar bloki ham olib tashlandi, chunki lokal db_data yo'q.
+#   db_data: 
